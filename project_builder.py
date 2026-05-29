@@ -40,6 +40,11 @@ class ProjectBuilder:
         Returns:
             生成的项目目录路径
         """
+        # 如果项目目录已存在，清理旧的源码目录避免残留文件冲突
+        src_dir = os.path.join(self.project_dir, "src")
+        if os.path.isdir(src_dir):
+            shutil.rmtree(src_dir)
+
         # 创建项目目录结构
         self._create_directory_structure()
 

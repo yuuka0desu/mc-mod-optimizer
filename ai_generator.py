@@ -250,23 +250,32 @@ class AIGenerator:
         return prompt
 
     def _build_client_system_prompt(self) -> str:
-        return """你是一个 Minecraft Forge mod 开发专家，专注于客户端性能优化。你的任务是根据客户端日志分析结果，生成一个优化客户端性能的 Forge mod。
+        return """你是一个 Minecraft Forge 1.20.1 mod 开发专家，专注于客户端性能优化。你的任务是根据客户端日志分析结果，生成一个优化客户端性能的 Forge mod。
+
+重要 API 约束（Forge 1.20.1 / 47.2.0）：
+- 客户端 Tick 事件使用 net.minecraftforge.event.TickEvent.ClientTickEvent（不是 net.minecraftforge.client.event.ClientTickEvent）
+- 世界卸载事件使用 net.minecraftforge.event.level.LevelEvent.Unload（不是 ClientLevelEvent）
+- LevelEvent.getLevel() 返回 LevelAccessor，需要强转为 Level 或 ClientLevel
+- invalidateCaps() 方法在 Entity 类上直接可用（不在 ICapabilityProvider 接口上）
+- ClientPlayerNetworkEvent.Clone 的 getOldPlayer() 和 getNewPlayer() 返回 LocalPlayer
+- Mixin 的 callback 包是 org.spongepowered.asm.mixin.callback.CallbackInfo
+- Entity.remove() 方法签名是 remove(Entity.RemovalReason)
+- 使用 @Mod.EventBusSubscriber(modid = "modid", value = Dist.CLIENT) 自动注册事件
+- 类名必须与文件名一致（Java 规范）
 
 要求：
 1. 生成完整可编译的 Java 代码
 2. 针对客户端性能问题进行优化，包括但不限于：
-   - 渲染优化（减少 draw call、优化 VBO、LOD 系统）
    - 内存优化（纹理缓存管理、模型缓存、对象池化）
-   - 帧率优化（异步加载、延迟初始化、跳帧策略）
-   - 粒子/实体渲染裁剪和批处理
+   - 粒子/实体渲染裁剪
 3. 重点处理客户端内存泄漏：
-   - LocalPlayer 重生/维度切换时的引用泄漏（类似服务端 ServerPlayer clone 问题）
-   - 监听 ClientPlayerNetworkEvent.LoggingIn 清理旧玩家引用
+   - LocalPlayer 重生/维度切换时的引用泄漏
+   - 监听 ClientPlayerNetworkEvent.Clone 和 LoggingOut 清理旧玩家引用
    - 其他 mod 的静态缓存持有旧 LocalPlayer/Entity 引用导致 GC 无法回收
    - 维度切换时旧 ClientLevel 的资源未释放
-   - Capability 在玩家重建后未 invalidate
-4. 使用 Forge 客户端事件系统（RenderLevelStageEvent、ClientTickEvent、ClientPlayerNetworkEvent 等）
-5. 如果需要修改其他 mod 的渲染行为，使用 Mixin 注入
+   - 在旧玩家上调用 invalidateCaps() 断开引用链
+4. 使用 Forge 客户端事件系统（TickEvent.ClientTickEvent、ClientPlayerNetworkEvent、LevelEvent.Unload）
+5. 如果需要 Mixin，注入 Entity.remove(RemovalReason) 方法
 6. 使用 @OnlyIn(Dist.CLIENT) 确保服务端安全
 7. 代码必须健壮，处理所有可能的异常
 8. 添加详细的中文注释说明优化原理
@@ -341,23 +350,20 @@ class AIGenerator:
 {mods_text}
 
 ## 要求
-1. 生成一个主类（@Mod 注解），注册客户端事件处理器
+1. 生成一个主类（@Mod 注解），使用 @Mod.EventBusSubscriber 自动注册事件
 2. 生成客户端优化类，针对检测到的问题进行优化：
-   - 使用 RenderLevelStageEvent 优化渲染流程
-   - 使用 ClientTickEvent 进行定期清理
-   - 使用 TextureStitchEvent 优化纹理管理
-   - 使用 ModelEvent.BakingCompleted 优化模型缓存
+   - 使用 TickEvent.ClientTickEvent（注意：是 net.minecraftforge.event.TickEvent.ClientTickEvent）进行定期清理
+   - 使用 LevelEvent.Unload（注意：getLevel() 返回 LevelAccessor，需要检查 isClientSide()）
 3. 重点处理客户端内存泄漏和 LocalPlayer 引用问题：
-   - 监听 ClientPlayerNetworkEvent.LoggingIn / ClientPlayerNetworkEvent.Clone 事件
-   - 在客户端玩家重生/维度切换时，清理所有对旧 LocalPlayer 的引用
+   - 监听 ClientPlayerNetworkEvent.Clone 事件（getOldPlayer() 获取旧玩家）
+   - 监听 ClientPlayerNetworkEvent.LoggingOut 事件
+   - 在旧玩家上直接调用 invalidateCaps()（Entity 类上的方法）
    - 遍历其他 mod 的静态缓存（通过反射），清除持有旧玩家实例的字段
-   - 在 ClientLevel 切换时释放旧世界的实体渲染缓存和 Capability
-   - 调用旧玩家的 invalidateCaps() 断开 Capability 引用链
-4. 如果需要 Mixin 修改渲染管线，生成对应的 Mixin 类
+4. 如果需要 Mixin，注入 Entity.remove(Entity.RemovalReason) 方法，使用 org.spongepowered.asm.mixin.callback.CallbackInfo
 5. 所有客户端代码必须用 @OnlyIn(Dist.CLIENT) 标注
 6. 使用反射访问其他 mod 的字段，做好异常处理
 7. 确保即使目标 mod 不存在也不会崩溃
-8. 优化应该是非侵入性的，不改变游戏逻辑只提升性能
+8. 类名必须与 class_name 字段一致（Java 要求类名与文件名匹配）
 
 请生成完整的优化代码。"""
 
