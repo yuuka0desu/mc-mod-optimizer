@@ -27,34 +27,37 @@ class AIGenerator:
         mod_id: str = "serverfix",
         mc_version: str = "1.20.1",
         mode: str = "server",
+        raw_log_text: str = "",
     ) -> Optional[Dict]:
         """
         调用 AI 生成修复 mod 的代码。
         
+        新工作流：直接将日志原文和 mods 列表发给 AI，让 AI 自己分析并生成代码。
+        
         Args:
-            issues: 检测到的问题列表（LeakIssue.to_dict()）
+            issues: 检测到的问题列表（LeakIssue.to_dict()）（仅作参考）
             installed_mods: 已安装的 mod 列表
             mod_id: 生成的 mod ID
             mc_version: Minecraft 版本
             mode: "server" 或 "client"
+            raw_log_text: 原始日志文本（直接发给 AI 分析）
         
         Returns:
-            生成结果字典:
-            {
-                "main_class": {"package": str, "class_name": str, "code": str},
-                "event_handlers": [{"package": str, "class_name": str, "code": str}, ...],
-                "mixins": [{"package": str, "class_name": str, "code": str}, ...],
-                "description": str,
-                "dependencies": [str, ...]  # 需要的 mod jar 作为编译依赖
-            }
+            生成结果字典
         """
         self.progress("正在构建 AI 提示词...")
 
-        if mode == "client":
+        if raw_log_text:
+            # 新工作流：直接发送原始日志给 AI
+            prompt = self._build_raw_prompt(raw_log_text, installed_mods, mod_id, mc_version, mode)
+        elif mode == "client":
             prompt = self._build_client_prompt(issues, installed_mods, mod_id, mc_version)
-            system_prompt = self._build_client_system_prompt()
         else:
             prompt = self._build_prompt(issues, installed_mods, mod_id, mc_version)
+
+        if mode == "client":
+            system_prompt = self._build_client_system_prompt()
+        else:
             system_prompt = self._build_system_prompt()
 
         self.progress("正在调用 AI API 生成代码...")
@@ -71,6 +74,74 @@ class AIGenerator:
         self.progress(f"{'='*50}\n")
 
         self.progress("正在解析 AI 返回的代码...")
+
+        result = self._parse_response(response, mod_id)
+        return result
+
+    def request_fix(self, error_log: str, original_code: Dict, mod_id: str = "serverfix",
+                    mc_version: str = "1.20.1", mode: str = "server") -> Optional[Dict]:
+        """
+        将构建错误发送给 AI，请求修复代码。
+        
+        Args:
+            error_log: Gradle 构建错误日志
+            original_code: 原始生成的代码字典
+            mod_id: mod ID
+            mc_version: MC 版本
+            mode: server/client
+        
+        Returns:
+            修复后的代码字典，失败返回 None
+        """
+        self.progress("\n正在将编译错误发送给 AI 请求修复...")
+
+        # 收集原始代码
+        code_summary = ""
+        if original_code.get("main_class"):
+            mc = original_code["main_class"]
+            code_summary += f"\n### {mc['class_name']}.java\n```java\n{mc['code']}\n```\n"
+        for handler in original_code.get("event_handlers", []):
+            code_summary += f"\n### {handler['class_name']}.java\n```java\n{handler['code']}\n```\n"
+        for mixin in original_code.get("mixins", []):
+            code_summary += f"\n### {mixin['class_name']}.java\n```java\n{mixin['code']}\n```\n"
+
+        fix_prompt = f"""之前生成的 Minecraft Forge 1.20.1 mod 代码编译失败，请修复以下错误。
+
+## 编译错误日志
+```
+{error_log}
+```
+
+## 原始代码
+{code_summary}
+
+## Forge 1.20.1 API 重要提示
+- ClientPlayerNetworkEvent 在 net.minecraftforge.client.event 包下
+- 客户端 Tick 事件是 net.minecraftforge.event.TickEvent.ClientTickEvent
+- 世界卸载事件是 net.minecraftforge.event.level.LevelEvent.Unload
+- CallbackInfo 在 org.spongepowered.asm.mixin.injection.callback 包下
+- Mixin 注入原版方法必须用 SRG 名（m_xxxxx_）并加 remap = false
+- Entity.invalidateCaps() 直接在 Entity 上调用
+- 不要使用 @Environment 注解
+- 类名必须与文件名一致
+
+请输出修复后的完整代码，使用相同的 JSON 格式。"""
+
+        if mode == "client":
+            system_prompt = self._build_client_system_prompt()
+        else:
+            system_prompt = self._build_system_prompt()
+
+        response = self._call_ai(system_prompt, fix_prompt)
+        if not response:
+            self.progress("AI 修复请求失败")
+            return None
+
+        self.progress(f"\n{'='*50}")
+        self.progress("AI 修复返回:")
+        self.progress(f"{'='*50}")
+        self.progress(response)
+        self.progress(f"{'='*50}\n")
 
         result = self._parse_response(response, mod_id)
         return result
@@ -250,61 +321,145 @@ class AIGenerator:
         return prompt
 
     def _build_client_system_prompt(self) -> str:
-        return """你是一个 Minecraft Forge 1.20.1 mod 开发专家，专注于客户端性能优化。你的任务是根据客户端日志分析结果，生成一个优化客户端性能的 Forge mod。
+        return """你是一个 Minecraft Forge 1.20.1 mod 开发专家。你的任务是生成一个客户端性能优化 mod。
 
-重要 API 约束（Forge 1.20.1 / 47.2.0）：
-- 客户端 Tick 事件使用 net.minecraftforge.event.TickEvent.ClientTickEvent（不是 net.minecraftforge.client.event.ClientTickEvent）
-- 世界卸载事件使用 net.minecraftforge.event.level.LevelEvent.Unload（不是 ClientLevelEvent）
-- LevelEvent.getLevel() 返回 LevelAccessor，需要强转为 Level 或 ClientLevel
-- invalidateCaps() 方法在 Entity 类上直接可用（不在 ICapabilityProvider 接口上）
-- ClientPlayerNetworkEvent.Clone 的 getOldPlayer() 和 getNewPlayer() 返回 LocalPlayer
-- Mixin 的 callback 包是 org.spongepowered.asm.mixin.callback.CallbackInfo
-- Entity.remove() 方法签名是 remove(Entity.RemovalReason)
-- 使用 @Mod.EventBusSubscriber(modid = "modid", value = Dist.CLIENT) 自动注册事件
-- 类名必须与文件名一致（Java 规范）
+下面是一个已经通过编译的完整参考示例，你必须严格遵循其中的 import 路径、API 用法和代码结构。不要使用示例中没有出现的 import 或 API。
 
-要求：
-1. 生成完整可编译的 Java 代码
-2. 针对客户端性能问题进行优化，包括但不限于：
-   - 内存优化（纹理缓存管理、模型缓存、对象池化）
-   - 粒子/实体渲染裁剪
-3. 重点处理客户端内存泄漏：
-   - LocalPlayer 重生/维度切换时的引用泄漏
-   - 监听 ClientPlayerNetworkEvent.Clone 和 LoggingOut 清理旧玩家引用
-   - 其他 mod 的静态缓存持有旧 LocalPlayer/Entity 引用导致 GC 无法回收
-   - 维度切换时旧 ClientLevel 的资源未释放
-   - 在旧玩家上调用 invalidateCaps() 断开引用链
-4. 使用 Forge 客户端事件系统（TickEvent.ClientTickEvent、ClientPlayerNetworkEvent、LevelEvent.Unload）
-5. 如果需要 Mixin，注入 Entity.remove(RemovalReason) 方法
-6. 使用 @OnlyIn(Dist.CLIENT) 确保服务端安全
-7. 代码必须健壮，处理所有可能的异常
-8. 添加详细的中文注释说明优化原理
+=== 参考示例：主类 ===
+```java
+package com.fix.clientfix;
 
-输出格式要求：
+import net.minecraftforge.fml.common.Mod;
+
+@Mod("clientfix")
+public class ClientFixMod {
+    public ClientFixMod() {
+    }
+}
+```
+
+=== 参考示例：事件处理器 ===
+```java
+package com.fix.clientfix;
+
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.LevelAccessor;
+import net.minecraftforge.api.distmarker.Dist;
+import net.minecraftforge.api.distmarker.OnlyIn;
+import net.minecraftforge.client.event.ClientPlayerNetworkEvent;
+import net.minecraftforge.event.TickEvent;
+import net.minecraftforge.event.level.LevelEvent;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.common.Mod;
+
+import java.lang.reflect.Field;
+import java.util.Map;
+
+@OnlyIn(Dist.CLIENT)
+@Mod.EventBusSubscriber(modid = "clientfix", value = Dist.CLIENT)
+public class ClientOptimizer {
+
+    private static int tickCounter = 0;
+
+    @SubscribeEvent
+    public static void onClientTick(TickEvent.ClientTickEvent event) {
+        if (event.phase != TickEvent.Phase.END) return;
+        if (++tickCounter < 600) return;
+        tickCounter = 0;
+        // 定期清理逻辑
+    }
+
+    @SubscribeEvent
+    public static void onPlayerClone(ClientPlayerNetworkEvent.Clone event) {
+        LocalPlayer oldPlayer = event.getOldPlayer();
+        if (oldPlayer != null) {
+            try { oldPlayer.invalidateCaps(); } catch (Exception e) {}
+            // 清理旧玩家引用
+        }
+    }
+
+    @SubscribeEvent
+    public static void onPlayerLogout(ClientPlayerNetworkEvent.LoggingOut event) {
+        LocalPlayer player = event.getPlayer();
+        if (player != null) {
+            try { player.invalidateCaps(); } catch (Exception e) {}
+        }
+    }
+
+    @SubscribeEvent
+    public static void onWorldUnload(LevelEvent.Unload event) {
+        LevelAccessor level = event.getLevel();
+        if (level.isClientSide()) {
+            // 清理世界相关缓存
+        }
+    }
+
+    public static void onEntityRemoved(Entity entity) {
+        // 由 Mixin 调用，清理实体缓存
+    }
+}
+```
+
+=== 参考示例：Mixin ===
+```java
+package com.fix.clientfix.mixin;
+
+import com.fix.clientfix.ClientOptimizer;
+import net.minecraft.world.entity.Entity;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(Entity.class)
+public abstract class EntityRemoveMixin {
+    @Inject(method = "m_142687_", at = @At("RETURN"), remap = false)
+    private void onRemove(Entity.RemovalReason reason, CallbackInfo ci) {
+        Entity self = (Entity) (Object) this;
+        if (self.level().isClientSide()) {
+            ClientOptimizer.onEntityRemoved(self);
+        }
+    }
+}
+```
+
+=== 绝对禁止使用的错误 API ===
+- net.minecraftforge.event.network.ClientPlayerNetworkEvent（错误包路径）
+- net.minecraftforge.client.event.ClientTickEvent（不存在）
+- net.minecraftforge.client.event.ClientLevelEvent（不存在）
+- org.spongepowered.asm.mixin.callback.CallbackInfo（错误包路径）
+- org.spongepowered.asm.mixin.Environment（不存在）
+- @Environment(EnvType.CLIENT)（不存在）
+- ICapabilityProvider.invalidateCaps()（方法在 Entity 上）
+- @Inject(method = "remove", ...)（必须用 SRG 名 "m_142687_" 并加 remap = false）
+
+=== 输出格式 ===
 请严格按照以下 JSON 格式输出，不要添加任何其他文字：
 
 ```json
 {
   "description": "优化模组的简要描述",
-  "dependencies": ["需要作为编译依赖的mod文件名"],
+  "dependencies": [],
   "main_class": {
-    "package": "com.fix.modid",
-    "class_name": "MainModClass",
-    "code": "完整的Java源码"
+    "package": "com.fix.clientfix",
+    "class_name": "类名",
+    "code": "完整Java源码"
   },
   "event_handlers": [
     {
-      "package": "com.fix.modid",
-      "class_name": "ClientOptimizer",
-      "code": "完整的Java源码"
+      "package": "com.fix.clientfix",
+      "class_name": "类名",
+      "code": "完整Java源码"
     }
   ],
   "mixins": [
     {
-      "package": "com.fix.modid.mixin",
-      "class_name": "SomeMixin",
-      "code": "完整的Java源码",
-      "target_class": "被注入的目标类全限定名"
+      "package": "com.fix.clientfix.mixin",
+      "class_name": "类名",
+      "code": "完整Java源码",
+      "target_class": "目标类全限定名"
     }
   ]
 }
@@ -359,13 +514,89 @@ class AIGenerator:
    - 监听 ClientPlayerNetworkEvent.LoggingOut 事件
    - 在旧玩家上直接调用 invalidateCaps()（Entity 类上的方法）
    - 遍历其他 mod 的静态缓存（通过反射），清除持有旧玩家实例的字段
-4. 如果需要 Mixin，注入 Entity.remove(Entity.RemovalReason) 方法，使用 org.spongepowered.asm.mixin.callback.CallbackInfo
+4. 如果需要 Mixin，注入 Entity.remove(RemovalReason)，method 必须写 SRG 名 "m_142687_"，不能写 "remove"
 5. 所有客户端代码必须用 @OnlyIn(Dist.CLIENT) 标注
 6. 使用反射访问其他 mod 的字段，做好异常处理
 7. 确保即使目标 mod 不存在也不会崩溃
 8. 类名必须与 class_name 字段一致（Java 要求类名与文件名匹配）
 
 请生成完整的优化代码。"""
+
+        return prompt
+
+    def _build_raw_prompt(
+        self,
+        raw_log_text: str,
+        installed_mods: List[Dict],
+        mod_id: str,
+        mc_version: str,
+        mode: str,
+    ) -> str:
+        """直接将原始日志和 mods 列表发给 AI，让 AI 自己分析并生成代码"""
+        # 限制日志长度避免超出 token 限制（保留最后 8000 字符，通常包含最关键的错误）
+        max_log_chars = 8000
+        if len(raw_log_text) > max_log_chars:
+            log_excerpt = "...(日志过长，仅展示最后部分)...\n" + raw_log_text[-max_log_chars:]
+        else:
+            log_excerpt = raw_log_text
+
+        # 构建 mods 列表
+        mods_text = ""
+        for mod in installed_mods[:50]:
+            mods_text += f"- {mod['display_name']} ({mod['mod_id']}) v{mod['version']} [{mod['file_name']}]\n"
+
+        mode_desc = "客户端" if mode == "client" else "服务端"
+        side_note = ""
+        if mode == "client":
+            side_note = """
+重点关注客户端特有问题：
+- LocalPlayer 重生/维度切换时的引用泄漏
+- 实体渲染缓存未释放
+- 纹理/模型缓存无限增长
+- 粒子系统溢出
+- 音频资源泄漏
+- 其他 mod 的静态缓存持有已移除实体的引用"""
+        else:
+            side_note = """
+重点关注服务端特有问题：
+- ServerPlayer 重生/退出时的引用泄漏
+- Summoned/Minion 实体持有已失效玩家引用
+- 静态 Map/Set 无限增长
+- Capability 未正确 invalidate
+- 区块卸载后实体引用未清理"""
+
+        prompt = f"""请分析以下 Minecraft {mc_version} Forge {mode_desc}的日志和已安装 mod 列表，自行判断存在的性能问题和内存泄漏，然后生成一个针对性的修复/优化 mod。
+
+## 生成的 Mod 信息
+- Mod ID: {mod_id}
+- 包名: com.fix.{mod_id}
+- Minecraft 版本: {mc_version}
+- Forge 版本: 47.2.0
+- 运行端: {mode_desc}
+
+## 原始日志
+```
+{log_excerpt}
+```
+
+## 已安装的 Mod 列表（共 {len(installed_mods)} 个）
+{mods_text}
+
+## 你需要做的
+1. 分析日志中的错误、警告、性能问题
+2. 结合已安装的 mod 列表，判断哪些 mod 可能导致问题
+3. 生成一个完整的修复/优化 mod，包含：
+   - 主类（@Mod 注解）
+   - 事件处理类（处理玩家退出/重生/维度切换等事件）
+   - Mixin 类（如果需要注入其他 mod 或原版代码）
+{side_note}
+
+## 技术要求
+- 使用反射访问其他 mod 的字段，所有反射操作用 try-catch 包裹
+- 即使目标 mod 不存在也不能崩溃
+- 代码必须能在 Forge 1.20.1 (47.2.0) 上编译通过
+
+请生成完整代码。"""
 
         return prompt
 

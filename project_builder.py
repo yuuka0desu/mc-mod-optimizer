@@ -268,6 +268,7 @@ side="BOTH"
             shutil.copy2(gradlew_bat_src, gradlew_bat_dst)
 
 
+
 def auto_build_project(project_dir: str, progress_callback: Callable[[str], None] = None) -> Optional[str]:
     """
     自动构建 Forge mod 项目，生成 jar 文件。
@@ -334,10 +335,12 @@ def auto_build_project(project_dir: str, progress_callback: Callable[[str], None
         )
 
         # 实时输出构建日志
+        build_output = []
         for line in process.stdout:
             line = line.rstrip()
             if line:
                 log(f"  [gradle] {line}")
+                build_output.append(line)
 
         process.wait()
 
@@ -353,11 +356,17 @@ def auto_build_project(project_dir: str, progress_callback: Callable[[str], None
                 return None
         else:
             log(f"\n构建失败 (退出码: {process.returncode})")
-            log("请检查上方的错误信息，常见原因：")
-            log("  - JDK 版本不兼容（需要 JDK 17+）")
-            log("  - 网络问题导致依赖下载失败")
-            log("  - 编译依赖的 mod jar 缺失（检查 libs/ 目录）")
-            return None
+            # 返回错误信息字符串（以 "BUILD_ERROR:" 前缀标识）
+            # 收集所有可能包含错误信息的行（编译错误、符号找不到、类型不匹配等）
+            error_lines = [l for l in build_output if any(kw in l for kw in [
+                "error", "Error", "FAILED", "cannot", "symbol",
+                "private", "public", "access", "找不到", "错误",
+                "incompatible", "unreported", "package", "does not exist",
+                ".java:", "^",
+            ])]
+            # 限制长度避免 token 过多
+            error_text = "\n".join(error_lines[:30])
+            return f"BUILD_ERROR:{error_text}" if error_text else "BUILD_ERROR:Unknown compilation error"
 
     except FileNotFoundError:
         log(f"错误: 无法执行 Gradle 命令: {gradle_cmd}")

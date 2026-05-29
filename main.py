@@ -476,10 +476,25 @@ class Application(tk.Tk):
             mod_id = self.mod_id_var.get().strip()
             output_path = self.output_path_var.get().strip()
             mods_path = self.mods_path_var.get().strip()
+            log_path = self.log_path_var.get().strip()
             mode = self.mode_var.get()
             mode_name = "客户端" if mode == "client" else "服务端"
 
-            # 准备问题数据
+            # 读取原始日志文本
+            raw_log_text = ""
+            if log_path:
+                if os.path.isfile(log_path):
+                    log_files = [log_path]
+                else:
+                    log_files = find_log_files(log_path)
+                for lf in log_files[:5]:  # 最多读取5个日志文件
+                    try:
+                        with open(lf, "r", encoding="utf-8", errors="replace") as f:
+                            raw_log_text += f.read() + "\n"
+                    except IOError:
+                        pass
+
+            # 准备问题数据（作为参考）
             issues_data = []
             for issue in self.issues:
                 if isinstance(issue, dict):
@@ -487,8 +502,9 @@ class Application(tk.Tk):
                 else:
                     issues_data.append(issue.to_dict())
 
-            # 调用 AI 生成代码
+            # 调用 AI 生成代码（直接发送原始日志）
             self._log(f"\n开始生成{mode_name}优化模组...")
+            self._log(f"将原始日志 ({len(raw_log_text)} 字符) 和 {len(self.installed_mods)} 个 mod 信息直接发送给 AI 分析...")
             generator = AIGenerator(self.config_data, progress_callback=self._log)
             result = generator.generate_fix_mod(
                 issues=issues_data,
@@ -496,6 +512,7 @@ class Application(tk.Tk):
                 mod_id=mod_id,
                 mc_version=self.config_data.get("minecraft_version", "1.20.1"),
                 mode=mode,
+                raw_log_text=raw_log_text,
             )
 
             if not result:
@@ -521,16 +538,50 @@ class Application(tk.Tk):
             if self.auto_build_var.get():
                 self._log(f"\n{'='*50}")
                 self._log("开始自动构建...")
-                jar_path = auto_build_project(project_dir, progress_callback=self._log)
-                if jar_path:
-                    self._log(f"\n构建完成! jar 文件:")
+                build_result = auto_build_project(project_dir, progress_callback=self._log)
+
+                max_retries = 10
+                current_code = result
+                retry_count = 0
+
+                while build_result and build_result.startswith("BUILD_ERROR:") and retry_count < max_retries:
+                    retry_count += 1
+                    error_log = build_result[len("BUILD_ERROR:"):]
+                    self._log(f"\n构建失败 (第 {retry_count}/{max_retries} 次重试)，正在请求 AI 修复...")
+                    self._log(f"错误信息: {error_log[:500]}")
+
+                    fixed_result = generator.request_fix(
+                        error_log=error_log,
+                        original_code=current_code,
+                        mod_id=mod_id,
+                        mc_version=self.config_data.get("minecraft_version", "1.20.1"),
+                        mode=mode,
+                    )
+
+                    if not fixed_result:
+                        self._log(f"AI 修复请求失败，停止重试")
+                        break
+
+                    self._log(f"AI 返回修复代码，重新组装项目 (第 {retry_count} 次)...")
+                    current_code = fixed_result
+                    project_dir = builder.build(fixed_result, source_mods_path=mods_path)
+                    self._log("重新构建...")
+                    build_result = auto_build_project(project_dir, progress_callback=self._log)
+
+                # 判断最终结果
+                if build_result and not build_result.startswith("BUILD_ERROR:"):
+                    jar_path = build_result
+                    if retry_count > 0:
+                        self._log(f"\n经过 {retry_count} 次修复后构建成功! jar 文件:")
+                    else:
+                        self._log(f"\n构建完成! jar 文件:")
                     self._log(f"  {jar_path}")
                     if mode == "client":
                         self._log(f"\n将此 jar 复制到客户端 .minecraft/mods/ 目录即可使用")
                     else:
                         self._log(f"\n将此 jar 复制到服务器 mods/ 目录即可使用")
                 else:
-                    self._log("\n自动构建失败，你可以手动构建：")
+                    self._log(f"\n经过 {retry_count} 次重试仍然构建失败，请手动检查代码：")
                     self._log(f"  cd {project_dir}")
                     self._log(f"  gradle build")
             else:
